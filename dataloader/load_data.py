@@ -36,17 +36,27 @@ class CytologyDataset(Dataset):
         self.img_files = []
         self.mask_files = []
         
+        # Créer un dictionnaire des masques disponibles pour une recherche plus rapide
+        mask_dict = {}
+        for mask_file in os.listdir(mask_dir):
+            if mask_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                mask_dict[mask_file] = os.path.join(mask_dir, mask_file)
+        
         for img_file in os.listdir(img_dir):
             if not img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                 continue
                 
             img_path = os.path.join(img_dir, img_file)
-            mask_file = img_file  # Supposons que les noms de fichiers sont identiques
-            mask_path = os.path.join(mask_dir, mask_file)
             
-            if os.path.exists(mask_path):
-                self.img_files.append(img_path)
-                self.mask_files.append(mask_path)
+            # Convertir le nom d'image avec préfixe ann en nom de masque avec préfixe mask
+            # Format: X.svs_ann_Y.png -> X.svs_mask_Y.png
+            if "_ann_" in img_file:
+                mask_file = img_file.replace("_ann_", "_mask_")
+                mask_path = os.path.join(mask_dir, mask_file)
+                
+                if os.path.exists(mask_path):
+                    self.img_files.append(img_path)
+                    self.mask_files.append(mask_path)
         
         print(f"Chargé {len(self.img_files)} paires d'images/masques")
     
