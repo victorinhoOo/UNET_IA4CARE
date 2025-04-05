@@ -1,0 +1,55 @@
+# Dossiers de données
+coco_export/
+coco_export/*
+data/
+
+# Modèles sauvegardés
+saved_models/
+*.pt
+*.pth
+
+# Résultats et sorties
+results/
+visualizations/
+*.npy
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Système macOS
+.DS_Store
+._*
+
+# Système Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Fichiers IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log 
