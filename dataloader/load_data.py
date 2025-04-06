@@ -4,6 +4,8 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
+import glob
+from pathlib import Path
 
 class CytologyDataset(Dataset):
     """
@@ -514,6 +516,463 @@ def get_categorized_mask_loaders(img_root_dir, mask_root_dir, batch_size=8, val_
         shuffle=False,
         num_workers=workers,
         pin_memory=True
+    )
+    
+    return train_loader, val_loader, test_loader, n_classes
+
+# Classe pour le dataset de classification
+class CategorizedDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.categories = [d for d in os.listdir(root_dir) 
+                          if os.path.isdir(os.path.join(root_dir, d))]
+        self.categories.sort()  # Trier pour assurer la cohérence
+        self.category_to_idx = {cat: i for i, cat in enumerate(self.categories)}
+        
+        self.image_paths = []
+        self.labels = []
+        
+        for category in self.categories:
+            category_path = os.path.join(root_dir, category)
+            image_list = [f for f in os.listdir(category_path) 
+                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            for img_name in image_list:
+                img_path = os.path.join(category_path, img_name)
+                self.image_paths.append(img_path)
+                self.labels.append(self.category_to_idx[category])
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
+# Classe pour le dataset de segmentation avec masques
+class MaskDataset(Dataset):
+    def __init__(self, img_root_dir, mask_root_dir, transform=None, mask_transform=None):
+        self.img_root_dir = img_root_dir
+        self.mask_root_dir = mask_root_dir
+        self.transform = transform
+        self.mask_transform = mask_transform
+        
+        self.categories = [d for d in os.listdir(img_root_dir) 
+                          if os.path.isdir(os.path.join(img_root_dir, d))]
+        self.categories.sort()  # Trier pour assurer la cohérence
+        
+        self.image_paths = []
+        self.mask_paths = []
+        
+        for category in self.categories:
+            img_category_path = os.path.join(img_root_dir, category)
+            mask_category_path = os.path.join(mask_root_dir, category)
+            
+            # Vérifier si le dossier de masques correspondant existe
+            if not os.path.exists(mask_category_path):
+                print(f"Attention: Le dossier de masques pour la catégorie '{category}' n'existe pas.")
+                continue
+            
+            # Récupérer les images et les masques correspondants
+            image_list = [f for f in os.listdir(img_category_path) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            for img_name in image_list:
+                img_path = os.path.join(img_category_path, img_name)
+                mask_path = os.path.join(mask_category_path, img_name)
+                
+                # Vérifier si le masque correspondant existe
+                if os.path.exists(mask_path):
+                    self.image_paths.append(img_path)
+                    self.mask_paths.append(mask_path)
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
+        
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # Charger en niveaux de gris
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        if self.mask_transform:
+            mask = self.mask_transform(mask)
+        else:
+            # Convertir le masque en tensor sans normalisation
+            mask = torch.from_numpy(np.array(mask, dtype=np.int64))
+        
+        return image, mask
+
+# Classe pour le dataset multitask (segmentation + classification)
+class MultitaskDataset(Dataset):
+    def __init__(self, img_root_dir, mask_root_dir, transform=None, mask_transform=None):
+        self.img_root_dir = img_root_dir
+        self.mask_root_dir = mask_root_dir
+        self.transform = transform
+        self.mask_transform = mask_transform
+        
+        self.categories = [d for d in os.listdir(img_root_dir) 
+                          if os.path.isdir(os.path.join(img_root_dir, d))]
+        self.categories.sort()  # Trier pour assurer la cohérence
+        self.category_to_idx = {cat: i for i, cat in enumerate(self.categories)}
+        
+        self.image_paths = []
+        self.mask_paths = []
+        self.labels = []
+        
+        for category in self.categories:
+            img_category_path = os.path.join(img_root_dir, category)
+            mask_category_path = os.path.join(mask_root_dir, category)
+            
+            # Vérifier si le dossier de masques correspondant existe
+            if not os.path.exists(mask_category_path):
+                print(f"Attention: Le dossier de masques pour la catégorie '{category}' n'existe pas.")
+                continue
+            
+            # Récupérer les images et les masques correspondants
+            image_list = [f for f in os.listdir(img_category_path) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            for img_name in image_list:
+                img_path = os.path.join(img_category_path, img_name)
+                mask_path = os.path.join(mask_category_path, img_name)
+                
+                # Vérifier si le masque correspondant existe
+                if os.path.exists(mask_path):
+                    self.image_paths.append(img_path)
+                    self.mask_paths.append(mask_path)
+                    self.labels.append(self.category_to_idx[category])
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
+        label = self.labels[idx]
+        
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # Charger en niveaux de gris
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        if self.mask_transform:
+            mask = self.mask_transform(mask)
+        else:
+            # Convertir le masque en tensor sans normalisation
+            mask = torch.from_numpy(np.array(mask, dtype=np.int64))
+        
+        return image, mask, label
+
+# Définir la classe TransformedMultitaskSubset en dehors de la fonction
+class TransformedMultitaskSubset(Dataset):
+    def __init__(self, subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.subset)
+        
+    def __getitem__(self, idx):
+        dataset = self.subset.dataset
+        orig_idx = self.subset.indices[idx]
+        
+        img_path = dataset.image_paths[orig_idx]
+        mask_path = dataset.mask_paths[orig_idx]
+        label = dataset.labels[orig_idx]
+        
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # Charger en niveaux de gris
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Convertir le masque en tensor sans normalisation
+        mask_array = np.array(mask, dtype=np.int64)
+        # Limiter les valeurs à l'intervalle [0, n_classes-1]
+        n_classes = len(dataset.categories)
+        mask_array = np.clip(mask_array, 0, n_classes-1)
+        mask = torch.from_numpy(mask_array)
+        
+        return image, mask, label
+
+# À ajouter avec les autres classes en dehors des fonctions
+class TransformedMaskSubset(Dataset):
+    def __init__(self, subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.subset)
+        
+    def __getitem__(self, idx):
+        img_path = self.subset.dataset.image_paths[self.subset.indices[idx]]
+        mask_path = self.subset.dataset.mask_paths[self.subset.indices[idx]]
+        
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # Charger en niveaux de gris
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Convertir le masque en tensor sans normalisation
+        mask_array = np.array(mask, dtype=np.int64)
+        # Limiter les valeurs à l'intervalle [0, n_classes-1]
+        n_classes = len(self.subset.dataset.categories)
+        mask_array = np.clip(mask_array, 0, n_classes-1)
+        mask = torch.from_numpy(mask_array)
+        
+        return image, mask
+
+# Fonction pour obtenir les data loaders pour l'apprentissage multitâche
+def get_multitask_loaders(img_root_dir, mask_root_dir, batch_size=8, workers=4, seed=42, train_split=0.7, val_split=0.15):
+    # Définir le seed pour la reproductibilité
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    # Transformations pour les images
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Créer le dataset multitâche
+    full_dataset = MultitaskDataset(img_root_dir, mask_root_dir, transform=None)
+    
+    # Calculer les tailles des splits
+    total_size = len(full_dataset)
+    train_size = int(train_split * total_size)
+    val_size = int(val_split * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # Diviser le dataset en train, val, test
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    # Compter le nombre unique de classes (à la fois pour la segmentation et la classification)
+    n_classes = len(full_dataset.categories)
+    
+    # Appliquer les transformations
+    train_dataset_transformed = TransformedMultitaskSubset(train_dataset, train_transform)
+    val_dataset_transformed = TransformedMultitaskSubset(val_dataset, val_transform)
+    test_dataset_transformed = TransformedMultitaskSubset(test_dataset, val_transform)
+    
+    # Créer les data loaders
+    train_loader = DataLoader(
+        train_dataset_transformed, batch_size=batch_size, shuffle=True, num_workers=workers
+    )
+    val_loader = DataLoader(
+        val_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    test_loader = DataLoader(
+        test_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    
+    return train_loader, val_loader, test_loader, n_classes
+
+# Fonction pour obtenir les data loaders de classification
+def get_data_loaders(root_dir, batch_size=32, workers=4, train_split=0.7, val_split=0.15):
+    # Transformations pour les images
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Créer le dataset
+    dataset = CategorizedDataset(root_dir, transform=train_transform)
+    
+    # Récupérer les classes
+    categories = dataset.categories
+    
+    # Calculer les tailles des splits
+    total_size = len(dataset)
+    train_size = int(train_split * total_size)
+    val_size = int(val_split * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # Diviser le dataset en train, val, test
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size]
+    )
+    
+    # Appliquer des transformations différentes pour val et test
+    val_dataset.dataset = CategorizedDataset(root_dir, transform=val_transform)
+    test_dataset.dataset = CategorizedDataset(root_dir, transform=val_transform)
+    
+    # Créer les data loaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    
+    return train_loader, val_loader, test_loader, categories
+
+# Fonction pour obtenir les data loaders de classification à partir de données catégorisées
+def get_categorized_data_loaders(root_dir, batch_size=32, workers=4, seed=42, train_split=0.7, val_split=0.15):
+    # Définir le seed pour la reproductibilité
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    # Transformations pour les images
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Créer le dataset
+    full_dataset = CategorizedDataset(root_dir, transform=None)
+    
+    # Récupérer les catégories
+    categories = full_dataset.categories
+    
+    # Calculer les tailles des splits
+    total_size = len(full_dataset)
+    train_size = int(train_split * total_size)
+    val_size = int(val_split * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # Diviser le dataset en train, val, test
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    # Créer des datasets avec les transformations appropriées
+    class TransformedSubset(Dataset):
+        def __init__(self, subset, transform=None):
+            self.subset = subset
+            self.transform = transform
+            
+        def __len__(self):
+            return len(self.subset)
+            
+        def __getitem__(self, idx):
+            img_path = self.subset.dataset.image_paths[self.subset.indices[idx]]
+            label = self.subset.dataset.labels[self.subset.indices[idx]]
+            
+            image = Image.open(img_path).convert('RGB')
+            
+            if self.transform:
+                image = self.transform(image)
+                
+            return image, label
+    
+    # Appliquer les transformations
+    train_dataset_transformed = TransformedSubset(train_dataset, train_transform)
+    val_dataset_transformed = TransformedSubset(val_dataset, val_transform)
+    test_dataset_transformed = TransformedSubset(test_dataset, val_transform)
+    
+    # Créer les data loaders
+    train_loader = DataLoader(
+        train_dataset_transformed, batch_size=batch_size, shuffle=True, num_workers=workers
+    )
+    val_loader = DataLoader(
+        val_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    test_loader = DataLoader(
+        test_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    
+    return train_loader, val_loader, test_loader, categories
+
+# Fonction pour obtenir les data loaders de segmentation
+def get_categorized_mask_loaders(img_root_dir, mask_root_dir, batch_size=8, workers=4, seed=42, train_split=0.7, val_split=0.15):
+    # Définir le seed pour la reproductibilité
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    # Transformations pour les images
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Créer le dataset
+    full_dataset = MaskDataset(img_root_dir, mask_root_dir, transform=None)
+    
+    # Calculer les tailles des splits
+    total_size = len(full_dataset)
+    train_size = int(train_split * total_size)
+    val_size = int(val_split * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # Diviser le dataset en train, val, test
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    # Compter le nombre unique de classes dans les masques
+    # Charger quelques masques et déterminer le nombre de classes
+    n_classes = 0
+    # Parcourir un petit nombre d'échantillons pour trouver le nombre de classes
+    for i in range(min(100, len(full_dataset))):
+        _, mask = full_dataset[i]
+        n_classes = max(n_classes, torch.max(mask).item() + 1)
+    
+    # Créer des datasets avec les transformations appropriées
+    train_dataset_transformed = TransformedMaskSubset(train_dataset, train_transform)
+    val_dataset_transformed = TransformedMaskSubset(val_dataset, val_transform)
+    test_dataset_transformed = TransformedMaskSubset(test_dataset, val_transform)
+    
+    # Créer les data loaders
+    train_loader = DataLoader(
+        train_dataset_transformed, batch_size=batch_size, shuffle=True, num_workers=workers
+    )
+    val_loader = DataLoader(
+        val_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
+    )
+    test_loader = DataLoader(
+        test_dataset_transformed, batch_size=batch_size, shuffle=False, num_workers=workers
     )
     
     return train_loader, val_loader, test_loader, n_classes 

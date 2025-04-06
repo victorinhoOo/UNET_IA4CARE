@@ -8,10 +8,13 @@ from torch.utils.data import DataLoader
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import torch.nn as nn
+from PIL import Image
+import torch.nn.functional as F
 
 # Import des modules personnalisés
-from model.unet import UNet, CombinedLoss
-from dataloader.load_data import get_data_loaders, get_categorized_data_loaders, get_categorized_mask_loaders
+from model.unet import UNet, CombinedLoss, MultiTaskLoss
+from dataloader.load_data import (get_data_loaders, get_categorized_data_loaders, 
+                                  get_categorized_mask_loaders, get_multitask_loaders)
 
 # Fonction pour analyser les arguments
 def parse_args():
@@ -26,8 +29,9 @@ def parse_args():
                         help='Dossier pour sauvegarder les modèles')
     
     # Mode de fonctionnement
-    parser.add_argument('--mode', type=str, default='segmentation', choices=['segmentation', 'classification', 'binary_segmentation'],
-                        help='Mode d\'entraînement: segmentation (multiclasse), binary_segmentation (fond/silhouette) ou classification')
+    parser.add_argument('--mode', type=str, default='segmentation', 
+                        choices=['segmentation', 'classification', 'binary_segmentation', 'multitask'],
+                        help='Mode d\'entraînement: segmentation, classification, binary_segmentation ou multitask (segmentation+classification)')
     
     # Paramètres du modèle
     parser.add_argument('--n_classes', type=int, default=None, 
@@ -48,6 +52,12 @@ def parse_args():
                         help='Coefficient de régularisation L2')
     parser.add_argument('--patience', type=int, default=10, 
                         help='Patience pour l\'early stopping')
+    
+    # Paramètres spécifiques à multitask
+    parser.add_argument('--weight_seg', type=float, default=0.7, 
+                        help='Poids pour la perte de segmentation dans le mode multitask')
+    parser.add_argument('--weight_cls', type=float, default=0.3, 
+                        help='Poids pour la perte de classification dans le mode multitask')
     
     # Choix de l'optimiseur et du scheduler
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'sgd', 'adamw'], 
@@ -81,20 +91,34 @@ def parse_args():
     
     return parser.parse_args()
 
-# Fonction pour sélectionner la fonction de perte
+# Fonction pour obtenir la fonction de perte selon le type
 def get_loss_function(loss_type, n_classes, weight_ce=0.5, weight_dice=0.5):
+    """
+    Retourne la fonction de perte selon le type spécifié
+    
+    Args:
+        loss_type (str): Type de fonction de perte ('ce', 'dice', 'combined', 'bce')
+        n_classes (int): Nombre de classes pour la segmentation
+        weight_ce (float): Poids pour la loss CrossEntropy dans la perte combinée
+        weight_dice (float): Poids pour la Dice Loss dans la perte combinée
+        
+    Returns:
+        torch.nn.Module: Fonction de perte
+    """
     if loss_type == 'ce':
-        return torch.nn.CrossEntropyLoss()
+        return nn.CrossEntropyLoss()
     elif loss_type == 'dice':
         from model.unet import DiceLoss
         return DiceLoss()
     elif loss_type == 'combined':
         return CombinedLoss(weight_ce=weight_ce, weight_dice=weight_dice)
     elif loss_type == 'bce':
-        # Pour la segmentation binaire (silhouettes)
-        return torch.nn.BCEWithLogitsLoss()
+        # Pour la segmentation binaire
+        if n_classes != 2:
+            print(f"[AVERTISSEMENT] BCEWithLogitsLoss utilisé avec {n_classes} classes au lieu de 2.")
+        return nn.BCEWithLogitsLoss()
     else:
-        raise ValueError(f"Type de perte non reconnu: {loss_type}")
+        raise ValueError(f"Type de fonction de perte non reconnu: {loss_type}")
 
 # Fonction pour sélectionner l'optimiseur
 def get_optimizer(optimizer_name, model_parameters, lr, weight_decay):
@@ -118,20 +142,31 @@ def get_scheduler(scheduler_name, optimizer, patience=10, T_max=10, step_size=30
     else:
         raise ValueError(f"Scheduler non reconnu: {scheduler_name}")
 
-# Fonction pour calculer le Dice Score (pour la segmentation)
-def dice_score(pred, target, smooth=1e-6, n_classes=6):
-    pred = torch.softmax(pred, dim=1)
-    pred = torch.argmax(pred, dim=1)
+# Fonction pour calculer le score Dice entre deux tenseurs
+def dice_score(pred, target, n_classes, smooth=1.0):
+    # S'assurer que les valeurs des masques cibles sont dans la plage [0, n_classes-1]
+    target = torch.clamp(target, 0, n_classes-1)
     
+    # Convertir les prédictions en classes (one-hot encoding)
+    pred = F.softmax(pred, dim=1)
+    
+    # Calculer le score Dice
     dice_scores = []
-    for c in range(n_classes):
-        pred_c = (pred == c).float()
-        target_c = (target == c).float()
-        
-        intersection = (pred_c * target_c).sum()
-        dice = (2. * intersection + smooth) / (pred_c.sum() + target_c.sum() + smooth)
-        dice_scores.append(dice.item())
     
+    for class_idx in range(n_classes):
+        # Créer des masques binaires pour cette classe
+        class_pred = (pred[:, class_idx] > 0.5).float()
+        class_target = (target == class_idx).float()
+        
+        # Calculer l'intersection et l'union
+        intersection = (class_pred * class_target).sum()
+        union = class_pred.sum() + class_target.sum()
+        
+        # Calculer le score Dice
+        class_dice = (2.0 * intersection + smooth) / (union + smooth)
+        dice_scores.append(class_dice.item())
+    
+    # Retourner la moyenne des scores Dice pour toutes les classes
     return np.mean(dice_scores)
 
 # Fonction pour calculer la précision (pour la classification)
@@ -219,7 +254,8 @@ def train_segmentation_epoch(model, dataloader, criterion, optimizer, device, n_
     pbar = tqdm(dataloader, desc='Entraînement')
     for images, masks in pbar:
         images = images.to(device)
-        masks = masks.to(device)
+        # Limiter les valeurs des masques à l'intervalle [0, n_classes-1]
+        masks = torch.clamp(masks, 0, n_classes-1).to(device)
         
         # Forward pass
         outputs = model(images)
@@ -232,7 +268,7 @@ def train_segmentation_epoch(model, dataloader, criterion, optimizer, device, n_
         
         # Statistiques
         running_loss += loss.item()
-        batch_dice = dice_score(outputs, masks, n_classes=n_classes)
+        batch_dice = dice_score(outputs, masks, n_classes)
         dice_scores.append(batch_dice)
         
         pbar.set_postfix({'loss': loss.item(), 'dice': batch_dice})
@@ -285,7 +321,8 @@ def evaluate_segmentation(model, dataloader, criterion, device, n_classes, visua
     with torch.no_grad():
         for i, (images, masks) in enumerate(tqdm(dataloader, desc='Évaluation')):
             images = images.to(device)
-            masks = masks.to(device)
+            # Limiter les valeurs des masques à l'intervalle [0, n_classes-1]
+            masks = torch.clamp(masks, 0, n_classes-1).to(device)
             
             # Forward pass
             outputs = model(images)
@@ -293,7 +330,7 @@ def evaluate_segmentation(model, dataloader, criterion, device, n_classes, visua
             
             # Statistiques
             running_loss += loss.item()
-            batch_dice = dice_score(outputs, masks, n_classes=n_classes)
+            batch_dice = dice_score(outputs, masks, n_classes)
             dice_scores.append(batch_dice)
             
             # Visualiser le premier batch
@@ -345,7 +382,130 @@ def evaluate_classification(model, dataloader, criterion, device, class_names, v
     
     return epoch_loss, epoch_acc
 
-# Fonction principale
+# Fonction d'entraînement pour le mode multitask
+def train_multitask_epoch(model, dataloader, criterion, optimizer, device, n_classes):
+    model.train()
+    running_loss = 0.0
+    seg_dice_scores = []
+    cls_correct = 0
+    cls_total = 0
+    
+    pbar = tqdm(dataloader, desc='Entraînement multitâche')
+    for images, masks, labels in pbar:
+        images = images.to(device)
+        masks = masks.to(device)
+        labels = labels.to(device)
+        
+        # Forward pass
+        seg_outputs, cls_outputs = model(images)
+        loss = criterion((seg_outputs, cls_outputs), (masks, labels))
+        
+        # Backward + optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Statistiques - segmentation
+        running_loss += loss.item()
+        batch_dice = dice_score(seg_outputs, masks, n_classes)
+        seg_dice_scores.append(batch_dice)
+        
+        # Statistiques - classification
+        _, predicted = torch.max(cls_outputs.data, 1)
+        cls_total += labels.size(0)
+        cls_correct += (predicted == labels).sum().item()
+        cls_accuracy = 100 * cls_correct / cls_total
+        
+        pbar.set_postfix({
+            'loss': loss.item(), 
+            'dice': batch_dice,
+            'acc': cls_accuracy
+        })
+    
+    epoch_loss = running_loss / len(dataloader)
+    epoch_dice = np.mean(seg_dice_scores)
+    epoch_acc = 100 * cls_correct / cls_total
+    
+    return epoch_loss, (epoch_dice, epoch_acc)
+
+# Fonction d'évaluation pour le mode multitask
+def evaluate_multitask(model, dataloader, criterion, device, n_classes, visualize=False, epoch=0):
+    model.eval()
+    running_loss = 0.0
+    seg_dice_scores = []
+    cls_correct = 0
+    cls_total = 0
+    
+    with torch.no_grad():
+        for i, (images, masks, labels) in enumerate(tqdm(dataloader, desc='Évaluation multitâche')):
+            images = images.to(device)
+            masks = masks.to(device)
+            labels = labels.to(device)
+            
+            # Forward pass
+            seg_outputs, cls_outputs = model(images)
+            loss = criterion((seg_outputs, cls_outputs), (masks, labels))
+            
+            # Statistiques - segmentation
+            running_loss += loss.item()
+            batch_dice = dice_score(seg_outputs, masks, n_classes)
+            seg_dice_scores.append(batch_dice)
+            
+            # Statistiques - classification
+            _, predicted = torch.max(cls_outputs.data, 1)
+            cls_total += labels.size(0)
+            cls_correct += (predicted == labels).sum().item()
+            
+            # Visualiser le premier batch
+            if visualize and i == 0:
+                visualize_multitask(images[0], masks[0], labels[0], 
+                                  seg_outputs[0], predicted[0], epoch)
+    
+    epoch_loss = running_loss / len(dataloader)
+    epoch_dice = np.mean(seg_dice_scores)
+    epoch_acc = 100 * cls_correct / cls_total
+    
+    return epoch_loss, (epoch_dice, epoch_acc)
+
+# Nouvelle fonction pour visualiser les résultats du mode multitask
+def visualize_multitask(image, mask, label, seg_pred, cls_pred, epoch, output_dir='results/multitask'):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Convertir en numpy
+    image = image.cpu().numpy().transpose(1, 2, 0)
+    # Dénormaliser l'image
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    image = std * image + mean
+    image = np.clip(image, 0, 1)
+    
+    mask = mask.cpu().numpy()
+    label = label.cpu().item()
+    cls_pred = cls_pred.cpu().item()
+    seg_pred = torch.argmax(torch.softmax(seg_pred, dim=0), dim=0).cpu().numpy()
+    
+    # Créer la figure
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.title(f'Image (vraie: {label}, pred: {cls_pred})')
+    plt.imshow(image)
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.title('Masque réel')
+    plt.imshow(mask, cmap='viridis')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.title('Prédiction segmentation')
+    plt.imshow(seg_pred, cmap='viridis')
+    plt.axis('off')
+    
+    plt.savefig(f'{output_dir}/epoch_{epoch}.png')
+    plt.close()
+
+# Fonction principale modifiée
 def main():
     # Récupérer les arguments
     args = parse_args()
@@ -387,6 +547,19 @@ def main():
             n_classes = args.n_classes
             
         print(f"Nombre de classes pour la segmentation: {n_classes}")
+    elif args.mode == 'multitask':
+        # Pour le mode multitask, nous avons besoin de charger les données avec
+        # à la fois les masques et les étiquettes de classe
+        print(f"Chargement des données pour le mode multitâche...")
+        # Note: Vous devez implémenter cette fonction dans dataloader/load_data.py
+        train_loader, val_loader, test_loader, n_classes = get_multitask_loaders(
+            img_root_dir=args.thumbnail_dir,
+            mask_root_dir=args.mask_dir,
+            batch_size=args.batch_size,
+            workers=args.workers,
+            seed=args.seed
+        )
+        print(f"Nombre de classes: {n_classes}")
     else:  # classification
         print(f"Chargement des données de classification depuis {args.thumbnail_dir}...")
         train_loader, val_loader, test_loader, categories = get_categorized_data_loaders(
@@ -405,7 +578,16 @@ def main():
         model = UNet(
             n_classes=n_classes,
             encoder=args.encoder,
-            pretrained=args.pretrained
+            pretrained=args.pretrained,
+            with_classification=False
+        )
+    elif args.mode == 'multitask':
+        print(f"Initialisation du modèle multitâche UNet++ pour {n_classes} classes...")
+        model = UNet(
+            n_classes=n_classes,
+            encoder=args.encoder,
+            pretrained=args.pretrained,
+            with_classification=True
         )
     else:  # classification
         print("Initialisation du modèle de classification...")
@@ -444,6 +626,19 @@ def main():
     elif args.mode == 'binary_segmentation':
         # Pour la segmentation binaire, utiliser BCEWithLogitsLoss
         criterion = get_loss_function('bce', n_classes)
+    elif args.mode == 'multitask':
+        # Pour le mode multitask, utiliser notre perte personnalisée
+        seg_loss = get_loss_function(
+            args.loss_type, 
+            n_classes, 
+            weight_ce=args.weight_ce, 
+            weight_dice=args.weight_dice
+        )
+        criterion = MultiTaskLoss(
+            segmentation_loss=seg_loss,
+            weight_seg=args.weight_seg,
+            weight_cls=args.weight_cls
+        )
     else:  # classification
         criterion = nn.CrossEntropyLoss()
     
@@ -453,12 +648,16 @@ def main():
             raise ValueError("Pour l'évaluation, spécifiez un chemin de modèle avec --model_path")
         
         # Charger le modèle
-        model.load_state_dict(torch.load(args.model_path))
+        checkpoint = torch.load(args.model_path, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
         
         # Évaluer sur l'ensemble de test
         if args.mode == 'segmentation':
             test_loss, test_metric = evaluate_segmentation(model, test_loader, criterion, device, n_classes)
             print(f"Test Loss: {test_loss:.4f}, Test Dice: {test_metric:.4f}")
+        elif args.mode == 'multitask':
+            test_loss, (test_dice, test_acc) = evaluate_multitask(model, test_loader, criterion, device, n_classes)
+            print(f"Test Loss: {test_loss:.4f}, Test Dice: {test_dice:.4f}, Test Accuracy: {test_acc:.2f}%")
         else:  # classification
             test_loss, test_metric = evaluate_classification(model, test_loader, criterion, device, categories)
             print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_metric:.2f}%")
@@ -485,8 +684,10 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        if args.mode == 'segmentation':
+        if args.mode in ['segmentation', 'binary_segmentation']:
             best_metric = checkpoint['best_dice']
+        elif args.mode == 'multitask':
+            best_metric = checkpoint['best_combined_metric']
         else:  # classification
             best_metric = checkpoint['best_acc']
         print(f"Reprise de l'entraînement à l'époque {start_epoch}")
@@ -496,23 +697,34 @@ def main():
         print(f"\nÉpoque {epoch+1}/{args.epochs}")
         
         # Entraînement selon le mode
-        if args.mode == 'segmentation':
+        if args.mode in ['segmentation', 'binary_segmentation']:
             train_loss, train_metric = train_segmentation_epoch(model, train_loader, criterion, optimizer, device, n_classes)
             print(f"Train Loss: {train_loss:.4f}, Train Dice: {train_metric:.4f}")
+        elif args.mode == 'multitask':
+            train_loss, (train_dice, train_acc) = train_multitask_epoch(model, train_loader, criterion, optimizer, device, n_classes)
+            print(f"Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}, Train Acc: {train_acc:.2f}%")
         else:  # classification
             train_loss, train_metric = train_classification_epoch(model, train_loader, criterion, optimizer, device)
             print(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_metric:.2f}%")
         
         # Validation périodique
         if (epoch + 1) % args.val_interval == 0:
-            if args.mode == 'segmentation':
+            if args.mode in ['segmentation', 'binary_segmentation']:
                 val_loss, val_metric = evaluate_segmentation(model, val_loader, criterion, device, n_classes, 
                                               visualize=True, epoch=epoch+1)
                 print(f"Val Loss: {val_loss:.4f}, Val Dice: {val_metric:.4f}")
+                current_metric = val_metric  # Pour la sauvegarde du meilleur modèle
+            elif args.mode == 'multitask':
+                val_loss, (val_dice, val_acc) = evaluate_multitask(model, val_loader, criterion, device, n_classes, 
+                                              visualize=True, epoch=epoch+1)
+                print(f"Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val Acc: {val_acc:.2f}%")
+                # Pour multitask, on utilise une combinaison de dice et accuracy comme métrique
+                current_metric = val_dice * 0.7 + (val_acc / 100.0) * 0.3
             else:  # classification
                 val_loss, val_metric = evaluate_classification(model, val_loader, criterion, device, categories, 
                                               visualize=True, epoch=epoch+1)
                 print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_metric:.2f}%")
+                current_metric = val_metric / 100.0  # Pour la sauvegarde du meilleur modèle
             
             # Mettre à jour le scheduler
             if args.scheduler == 'plateau':
@@ -521,38 +733,91 @@ def main():
                 scheduler.step()
             
             # Sauvegarder le meilleur modèle
-            if val_metric > best_metric:
-                best_metric = val_metric
+            if current_metric > best_metric:
+                best_metric = current_metric
                 model_name = f"model_{args.mode}_{args.encoder}_{n_classes}classes_best.pt"
-                torch.save({
+                
+                # Préparer les données à sauvegarder
+                save_dict = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': val_loss,
-                    'val_metric': val_metric,
-                    'best_metric': best_metric
-                }, os.path.join(args.output_dir, model_name))
-                print(f"Meilleur modèle sauvegardé avec {'Dice' if args.mode == 'segmentation' else 'Accuracy'}: {best_metric:.4f}")
+                }
+                
+                # Ajouter les métriques spécifiques au mode
+                if args.mode in ['segmentation', 'binary_segmentation']:
+                    save_dict.update({
+                        'val_dice': val_metric,
+                        'best_dice': best_metric
+                    })
+                elif args.mode == 'multitask':
+                    save_dict.update({
+                        'val_dice': val_dice,
+                        'val_acc': val_acc,
+                        'best_combined_metric': best_metric
+                    })
+                else:  # classification
+                    save_dict.update({
+                        'val_acc': val_metric,
+                        'best_acc': best_metric
+                    })
+                
+                torch.save(save_dict, os.path.join(args.output_dir, model_name))
+                
+                # Afficher un message adapté au mode
+                if args.mode in ['segmentation', 'binary_segmentation']:
+                    print(f"Meilleur modèle sauvegardé avec Dice: {val_metric:.4f}")
+                elif args.mode == 'multitask':
+                    print(f"Meilleur modèle sauvegardé avec Dice: {val_dice:.4f}, Acc: {val_acc:.2f}%")
+                else:  # classification
+                    print(f"Meilleur modèle sauvegardé avec Accuracy: {val_metric:.2f}%")
         
         # Sauvegarder le dernier modèle
         if (epoch + 1) % 10 == 0:
             model_name = f"model_{args.mode}_{args.encoder}_{n_classes}classes_epoch{epoch+1}.pt"
-            torch.save({
+            
+            # Préparer les données à sauvegarder
+            save_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'train_metric': train_metric,
-                'best_metric': best_metric
-            }, os.path.join(args.output_dir, model_name))
+                'optimizer_state_dict': optimizer.state_dict()
+            }
+            
+            # Ajouter les métriques spécifiques au mode
+            if args.mode in ['segmentation', 'binary_segmentation']:
+                save_dict.update({
+                    'train_loss': train_loss,
+                    'train_dice': train_metric,
+                    'best_dice': best_metric
+                })
+            elif args.mode == 'multitask':
+                save_dict.update({
+                    'train_loss': train_loss,
+                    'train_dice': train_dice,
+                    'train_acc': train_acc,
+                    'best_combined_metric': best_metric
+                })
+            else:  # classification
+                save_dict.update({
+                    'train_loss': train_loss,
+                    'train_acc': train_metric,
+                    'best_acc': best_metric
+                })
+            
+            torch.save(save_dict, os.path.join(args.output_dir, model_name))
     
     # Évaluation finale sur l'ensemble de test
     model_name = f"model_{args.mode}_{args.encoder}_{n_classes}classes_best.pt"
-    model.load_state_dict(torch.load(os.path.join(args.output_dir, model_name), weights_only=False)['model_state_dict'])
+    checkpoint = torch.load(os.path.join(args.output_dir, model_name), weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
     
-    if args.mode == 'segmentation':
+    if args.mode in ['segmentation', 'binary_segmentation']:
         test_loss, test_metric = evaluate_segmentation(model, test_loader, criterion, device, n_classes)
         print(f"\nTest Loss final: {test_loss:.4f}, Test Dice final: {test_metric:.4f}")
+    elif args.mode == 'multitask':
+        test_loss, (test_dice, test_acc) = evaluate_multitask(model, test_loader, criterion, device, n_classes)
+        print(f"\nTest Loss final: {test_loss:.4f}, Test Dice final: {test_dice:.4f}, Test Accuracy finale: {test_acc:.2f}%")
     else:  # classification
         test_loss, test_metric = evaluate_classification(model, test_loader, criterion, device, categories)
         print(f"\nTest Loss final: {test_loss:.4f}, Test Accuracy finale: {test_metric:.2f}%")
