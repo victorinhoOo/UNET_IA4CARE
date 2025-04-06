@@ -1,0 +1,19 @@
+Précision globale: 0.7610
+
+Précision par classe:
+Fond (arrière-plan): 0.00%
+Benin _10c: 59.21%
+Carcinome medullaire_: 57.60%
+Cellule de bordure de kyste: 51.39%
+Cellule inflammatoire lymphocyte: 96.69%
+Cellule inflammatoire macrophage: 49.01%
+Cellule inflammatoire polynucleaire: 98.95%
+Colloide dense: 18.64%
+Colloide fluide: 73.92%
+Groupe AUS nucleaire: 33.23%
+Groupe benin: 38.58%
+Groupe malin CPT: 63.29%
+Groupe microvesiculaire: 48.39%
+Groupe microvesiculaire avec atypies: 58.14%
+Groupe oncocytaire: 94.93%
+Pseudoinclusion nucleaire: 63.92%

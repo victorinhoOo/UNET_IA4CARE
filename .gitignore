@@ -2,6 +2,14 @@
 coco_export/
 coco_export/*
 data/
+categorized_mask/
+categorized_mask/*
+
+categorized_thumbnail_windows_224_224/
+categorized_thumbnail_windows_224_224/*
+
+saved_models/
+saved_models/*
 
 # Modèles sauvegardés
 saved_models/
